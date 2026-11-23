@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pac-Man Online — Multijugador</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#080d22;color:#f4f6ff;font-family:system-ui,Arial,sans-serif;display:flex;justify-content:center;min-height:100vh}
+main{width:min(100%,900px);padding:20px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}h1{margin:0;color:#ffe34d;font-size:clamp(25px,5vw,38px)}.panel{background:#111a38;border:1px solid #2a3768;border-radius:14px;padding:14px;margin:14px 0}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}input,button{font:inherit;border-radius:9px;padding:10px 12px;border:1px solid #43538b;background:#0b1230;color:white}button{cursor:pointer;background:#263b86;font-weight:700}button:hover{filter:brightness(1.2)}button:disabled{opacity:.5;cursor:not-allowed}#status{color:#b8c8ff;min-height:24px}.room{font-weight:800;color:#ffe34d;letter-spacing:2px}canvas{display:block;width:100%;max-width:600px;margin:12px auto;background:#05091b;border:3px solid #263b86;border-radius:12px;image-rendering:pixelated}.gameinfo{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:#d5ddff}.dpad{display:grid;grid-template-columns:repeat(3,48px);grid-template-rows:repeat(2,42px);gap:5px;justify-content:center;margin:10px auto}.dpad button{padding:4px}.help{font-size:13px;color:#aebbe8;line-height:1.5}
+</style>
+</head>
+<body><main>
+<div class="top"><h1>🟡 PAC-MAN ONLINE</h1><div id="status">Conéctate para comenzar una partida.</div></div>
+<section class="panel">
+ <div class="controls">
+  <button id="create">Crear sala</button>
+  <input id="roomInput" maxlength="8" placeholder="Código de sala">
+  <button id="join">Unirse</button>
+  <button id="leave" disabled>Salir</button>
+ </div>
+ <p>Comparte este código con tus amigos: <span class="room" id="roomCode">——</span></p>
+ <div class="gameinfo"><span id="players">Jugadores: 0</span><span id="score">Puntos: 0</span><span id="round">Bolitas restantes: 0</span></div>
+</section>
+<canvas id="game" width="600" height="520"></canvas>
+<div class="dpad">
+ <span></span><button data-dir="up">▲</button><span></span>
+ <button data-dir="left">◀</button><button data-dir="down">▼</button><button data-dir="right">▶</button>
+</div>
+<section class="panel help">
+ <b>Cómo jugar:</b> Una persona pulsa <b>Crear sala</b> y comparte el código. Los demás escriben el código y pulsan <b>Unirse</b>. Todos juegan en el mismo laberinto: recoge las bolitas y compite por la mayor puntuación. Usa las flechas o WASD; en móvil usa los botones. La sala funciona mediante conexión entre navegadores (PeerJS).
+ <br><b>Importante:</b> para jugar desde distintos dispositivos, publica este archivo en un sitio HTTPS (por ejemplo GitHub Pages). Se necesita conexión a Internet.
+</section>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(()=>{
+const canvas=document.getElementById('game'),ctx=canvas.getContext('2d');
+const statusEl=document.getElementById('status'),roomCode=document.getElementById('roomCode');
+const roomInput=document.getElementById('roomInput'),playersEl=document.getElementById('players'),scoreEl=document.getElementById('score'),roundEl=document.getElementById('round');
+const createBtn=document.getElementById('create'),joinBtn=document.getElementById('join'),leaveBtn=document.getElementById('leave');
+const TILE=30,COLS=20,ROWS=17;
+const mapRows=[
+"####################",
+"#........##........#",
+"#.##.###.##.###.##..#",
+"#o##...........##..o#",
+"#.##.##.####.##.##..#",
+"#......#....#.......#",
+"####.#.#.##.#.#.#####",
+".....#...##...#......",
+"####.#.######.#.#####",
+"#......#....#........#",
+"#.##.##.####.##.##...#",
+"#o...##......##.....o#",
+"###.##.######.##.#####",
+"#........##..........#",
+"#.####.#.##.#.####...#",
+"#....................#",
+"####################"
+];
+let peer=null,host=false,room='',conns={},players={},pellets=[],lastTick=0,loopId=null,localId='',myDir='left',world=null;
+const colors=['#ffdf32','#4de2ff','#ff73b5','#9dff65','#ff9d4d','#c59aff'];
+function freshWorld(){let dots=[];mapRows.forEach((r,y)=>[...r].forEach((c,x)=>{if(c==='.'||c==='o')dots.push({x,y,power:c==='o'})}));return {dots,players:{},started:true};}
+function setStatus(s){statusEl.textContent=s}
+function setConnected(on){createBtn.disabled=joinBtn.disabled=on;leaveBtn.disabled=!on}
+function randomCode(){return Math.random().toString(36).slice(2,7).toUpperCase()}
+function spawn(id,name){return {id,name,x:9+(Object.keys(players).length%3),y:7,dir:'left',next:'left',score:0,color:colors[Object.keys(players).length%colors.length],alive:true}}
+function connectPeer(id){return new Promise((resolve,reject)=>{peer=new Peer(id);peer.on('open',resolve);peer.on('error',e=>{setStatus('Error de conexión: '+e.type);reject(e)});peer.on('disconnected',()=>setStatus('Conexión interrumpida.'))})}
+function send(conn,msg){try{conn.send(msg)}catch(e){}}
+function broadcast(msg){Object.values(conns).forEach(c=>send(c,msg))}
+function sync(){if(!host)return;broadcast({type:'state',world})}
+function addPlayer(id,name,conn){
+ players[id]=spawn(id,name);if(conn){conns[id]=conn;conn.on('data',m=>handleMessage(id,m));conn.on('close',()=>{delete players[id];delete conns[id];sync();updateInfo()})}
+ updateInfo();if(host)sync();
+}
+function handleMessage(id,m){
+ if(!host)return;
+ if(m.type==='dir'&&players[id])players[id].next=m.dir;
+}
+function startHost(){
+ room=randomCode();localId='host-'+room;host=true;world=freshWorld();players={};conns={};addPlayer(localId,'Anfitrión');
+ connectPeer(localId).then(()=>{roomCode.textContent=room;roomInput.value=room;setStatus('Sala creada. ¡Invita a tus amigos!');setConnected(true);startLoop()}).catch(()=>{});
+ peer.on('connection',conn=>{conn.on('open',()=>{let id=conn.peer;addPlayer(id,'Jugador '+(Object.keys(players).length+1),conn);send(conn,{type:'welcome',id,world});sync()})});
+}
+async function joinRoom(){
+ const code=roomInput.value.trim().toUpperCase();if(!code){setStatus('Escribe el código de la sala.');return}
+ host=false;room=code;localId='';setStatus('Conectando a la sala '+code+'…');
+ try{await connectPeer('pac-'+randomCode());const conn=peer.connect('host-'+code,{reliable:true});conns.host=conn;
+ conn.on('open',()=>{setConnected(true);roomCode.textContent=code;setStatus('Conectado. ¡A jugar!');conn.on('data',m=>{if(m.type==='welcome'){localId=m.id;world=m.world;players=world.players||{};draw()}else if(m.type==='state'){world=m.world;players=world.players||{};draw();updateInfo()}});});
+ conn.on('error',()=>setStatus('No se pudo entrar. Comprueba el código y que el anfitrión siga conectado.'));
+ conn.on('close',()=>setStatus('El anfitrión cerró la conexión.'));
+ }catch(e){setStatus('No se pudo conectar. Intenta otra vez.')}
+}
+function leave(){if(peer)peer.destroy();peer=null;host=false;world=null;players={};conns={};room='';localId='';roomCode.textContent='——';setConnected(false);setStatus('Desconectado.');draw()}
+function updateInfo(){playersEl.textContent='Jugadores: '+Object.keys(players).length;let p=players[localId];scoreEl.textContent='Tus puntos: '+(p?p.score:0);roundEl.textContent='Bolitas restantes: '+(world?world.dots.length:0)}
+function wall(x,y){return y<0||y>=ROWS||x<0||x>=COLS||mapRows[y][x]==='#'}
+function move(p){
+ if(!p)return;let d=p.next,delta={left:[-1,0],right:[1,0],up:[0,-1],down:[0,1]};
+ if(d&& !wall(p.x+delta[d][0],p.y+delta[d][1]))p.dir=d;
+ let [dx,dy]=delta[p.dir];if(!wall(p.x+dx,p.y+dy)){p.x+=dx;p.y+=dy}
+}
+function tick(){
+ if(!host||!world)return;
+ Object.values(players).forEach(p=>{move(p);let i=world.dots.findIndex(q=>q.x===p.x&&q.y===p.y);if(i>=0){p.score+=world.dots[i].power?50:10;world.dots.splice(i,1)}});
+ if(!world.dots.length)world=freshWorld();
+ sync();draw();updateInfo();
+}
+function startLoop(){if(loopId)clearInterval(loopId);loopId=setInterval(tick,180)}
+function setDirection(d){myDir=d;if(host){if(players[localId])players[localId].next=d}else if(conns.host)send(conns.host,{type:'dir',dir:d})}
+function draw(){
+ ctx.clearRect(0,0,canvas.width,canvas.height);
+ for(let y=0;y<ROWS;y++)for(let x=0;x<COLS;x++){if(wall(x,y)){ctx.fillStyle='#172b78';ctx.fillRect(x*TILE+1,y*TILE+1,TILE-2,TILE-2);ctx.strokeStyle='#3f68e8';ctx.strokeRect(x*TILE+4,y*TILE+4,TILE-8,TILE-8)}}
+ if(world?.dots)world.dots.forEach(q=>{ctx.beginPath();ctx.fillStyle=q.power?'#fff2a8':'#ffe4a6';ctx.arc(q.x*TILE+15,q.y*TILE+15,q.power?6:2.8,0,Math.PI*2);ctx.fill()});
+ if(world?.players)Object.values(world.players).forEach(p=>{let x=p.x*TILE+15,y=p.y*TILE+15;ctx.beginPath();ctx.fillStyle=p.color||'#ffdf32';let a={right:0,left:Math.PI,up:-Math.PI/2,down:Math.PI/2}[p.dir]||0;ctx.moveTo(x,y);ctx.arc(x,y,12,a+.35,a+Math.PI*2-.35);ctx.closePath();ctx.fill();ctx.fillStyle='#fff';ctx.font='10px Arial';ctx.textAlign='center';ctx.fillText(p.name.slice(0,10),x,y-17)});
+ updateInfo();
+}
+document.addEventListener('keydown',e=>{let k=e.key.toLowerCase(),d={arrowleft:'left',a:'left',arrowright:'right',d:'right',arrowup:'up',w:'up',arrowdown:'down',s:'down'}[k];if(d){e.preventDefault();setDirection(d)}});
+document.querySelectorAll('[data-dir]').forEach(b=>b.addEventListener('click',()=>setDirection(b.dataset.dir)));
+createBtn.onclick=startHost;joinBtn.onclick=joinRoom;leaveBtn.onclick=leave;
+draw();
+})();
+</script></main></body></html>
